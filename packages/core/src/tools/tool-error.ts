@@ -39,6 +39,8 @@ export enum ToolErrorType {
   EDIT_NO_CHANGE = 'edit_no_change',
   EDIT_NO_CHANGE_LLM_JUDGEMENT = 'edit_no_change_llm_judgement',
   EDIT_OPERATION_TIMEOUT = 'edit_operation_timeout',
+  EDIT_VALIDATION_FAILED = 'edit_validation_failed',
+  EDIT_RETRY_BLOCKED = 'edit_retry_blocked',
 
   // Glob-specific Errors
   GLOB_EXECUTION_ERROR = 'glob_execution_error',

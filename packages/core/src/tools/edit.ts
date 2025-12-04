@@ -46,6 +46,10 @@ import {
   WRITE_FILE_TOOL_NAME,
 } from './tool-names.js';
 import { debugLogger } from '../utils/debugLogger.js';
+import {
+  validateEditPossibility,
+  getGlobalRetryTracker,
+} from '../utils/editValidator.js';
 
 /**
  * Maximum time allowed for an edit operation before timeout.
@@ -191,47 +195,103 @@ class EditToolInvocation
         type: ToolErrorType.FILE_NOT_FOUND,
       };
     } else if (currentContent !== null) {
-      // Editing an existing file
-      const correctedEdit = await ensureCorrectEdit(
+      // Check retry pattern before proceeding
+      const retryTracker = getGlobalRetryTracker();
+      const retryCheck = retryTracker.checkRetryPattern(
         this.resolvedPath,
-        currentContent,
-        params,
-        this.config.getGeminiClient(),
-        this.config.getBaseLlmClient(),
-        abortSignal,
+        params.old_string,
+        params.new_string,
       );
-      finalOldString = correctedEdit.params.old_string;
-      finalNewString = correctedEdit.params.new_string;
-      occurrences = correctedEdit.occurrences;
 
-      if (params.old_string === '') {
-        // Error: Trying to create a file that already exists
+      if (retryCheck.shouldBlock) {
         error = {
-          display: `Failed to edit. Attempted to create a file that already exists.`,
-          raw: `File already exists, cannot create: ${this.resolvedPath}`,
-          type: ToolErrorType.ATTEMPT_TO_CREATE_EXISTING_FILE,
+          display: `Edit blocked: ${retryCheck.reason}`,
+          raw: `Edit blocked after ${retryCheck.totalFailures} failures on ${this.resolvedPath}. ${retryCheck.suggestion}`,
+          type: ToolErrorType.EDIT_RETRY_BLOCKED,
         };
-      } else if (occurrences === 0) {
-        error = {
-          display: `Failed to edit, could not find the string to replace.`,
-          raw: `Failed to edit, 0 occurrences found for old_string in ${this.resolvedPath}. No edits made. The exact text in old_string was not found. Ensure you're not escaping content incorrectly and check whitespace, indentation, and context. Use ${READ_FILE_TOOL_NAME} tool to verify.`,
-          type: ToolErrorType.EDIT_NO_OCCURRENCE_FOUND,
-        };
-      } else if (occurrences !== expectedReplacements) {
-        const occurrenceTerm =
-          expectedReplacements === 1 ? 'occurrence' : 'occurrences';
+      } else {
+        // Early validation to detect obviously impossible edits
+        const validation = validateEditPossibility(
+          currentContent,
+          params.old_string,
+          params.new_string,
+        );
 
-        error = {
-          display: `Failed to edit, expected ${expectedReplacements} ${occurrenceTerm} but found ${occurrences}.`,
-          raw: `Failed to edit, Expected ${expectedReplacements} ${occurrenceTerm} but found ${occurrences} for old_string in file: ${this.resolvedPath}`,
-          type: ToolErrorType.EDIT_EXPECTED_OCCURRENCE_MISMATCH,
-        };
-      } else if (finalOldString === finalNewString) {
-        error = {
-          display: `No changes to apply. The old_string and new_string are identical.`,
-          raw: `No changes to apply. The old_string and new_string are identical in file: ${this.resolvedPath}`,
-          type: ToolErrorType.EDIT_NO_CHANGE,
-        };
+        if (!validation.isValid) {
+          // Record this as a failed attempt
+          retryTracker.recordAttempt(
+            this.resolvedPath,
+            params.old_string,
+            params.new_string,
+            false,
+            validation.errorCode,
+          );
+
+          error = {
+            display: `Edit validation failed: ${validation.reason}`,
+            raw: `Edit validation failed for ${this.resolvedPath}: ${validation.reason}. ${validation.suggestion}`,
+            type: ToolErrorType.EDIT_VALIDATION_FAILED,
+          };
+        }
+      }
+
+      // Only proceed with expensive LLM correction if validation passed
+      if (!error) {
+        // Editing an existing file
+        const correctedEdit = await ensureCorrectEdit(
+          this.resolvedPath,
+          currentContent,
+          params,
+          this.config.getGeminiClient(),
+          this.config.getBaseLlmClient(),
+          abortSignal,
+        );
+        finalOldString = correctedEdit.params.old_string;
+        finalNewString = correctedEdit.params.new_string;
+        occurrences = correctedEdit.occurrences;
+      }
+
+      // Only check LLM correction results if no error was set by validation
+      if (!error) {
+        if (params.old_string === '') {
+          // Error: Trying to create a file that already exists
+          error = {
+            display: `Failed to edit. Attempted to create a file that already exists.`,
+            raw: `File already exists, cannot create: ${this.resolvedPath}`,
+            type: ToolErrorType.ATTEMPT_TO_CREATE_EXISTING_FILE,
+          };
+        } else if (occurrences === 0) {
+          error = {
+            display: `Failed to edit, could not find the string to replace.`,
+            raw: `Failed to edit, 0 occurrences found for old_string in ${this.resolvedPath}. No edits made. The exact text in old_string was not found. Ensure you're not escaping content incorrectly and check whitespace, indentation, and context. Use ${READ_FILE_TOOL_NAME} tool to verify.`,
+            type: ToolErrorType.EDIT_NO_OCCURRENCE_FOUND,
+          };
+        } else if (occurrences !== expectedReplacements) {
+          const occurrenceTerm =
+            expectedReplacements === 1 ? 'occurrence' : 'occurrences';
+
+          error = {
+            display: `Failed to edit, expected ${expectedReplacements} ${occurrenceTerm} but found ${occurrences}.`,
+            raw: `Failed to edit, Expected ${expectedReplacements} ${occurrenceTerm} but found ${occurrences} for old_string in file: ${this.resolvedPath}`,
+            type: ToolErrorType.EDIT_EXPECTED_OCCURRENCE_MISMATCH,
+          };
+        } else if (finalOldString === finalNewString) {
+          error = {
+            display: `No changes to apply. The old_string and new_string are identical.`,
+            raw: `No changes to apply. The old_string and new_string are identical in file: ${this.resolvedPath}`,
+            type: ToolErrorType.EDIT_NO_CHANGE,
+          };
+        }
+
+        // Record the attempt result for retry tracking
+        const retryTracker = getGlobalRetryTracker();
+        retryTracker.recordAttempt(
+          this.resolvedPath,
+          params.old_string,
+          params.new_string,
+          !error, // success if no error
+          error?.type,
+        );
       }
     } else {
       // Should not happen if fileExists and no exception was thrown, but defensively:

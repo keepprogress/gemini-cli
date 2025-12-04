@@ -59,6 +59,7 @@ import { ApprovalMode } from '../policy/types.js';
 import type { Content, Part, SchemaUnion } from '@google/genai';
 import { StandardFileSystemService } from '../services/fileSystemService.js';
 import { WorkspaceContext } from '../utils/workspaceContext.js';
+import { resetGlobalRetryTracker } from '../utils/editValidator.js';
 
 describe('EditTool', () => {
   let tool: EditTool;
@@ -70,6 +71,7 @@ describe('EditTool', () => {
 
   beforeEach(() => {
     vi.restoreAllMocks();
+    resetGlobalRetryTracker(); // Reset retry tracker between tests
     tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'edit-tool-test-'));
     rootDir = path.join(tempDir, 'root');
     fs.mkdirSync(rootDir);
@@ -655,15 +657,11 @@ describe('EditTool', () => {
         old_string: 'nonexistent',
         new_string: 'replacement',
       };
-      // The default mockEnsureCorrectEdit will return 0 occurrences for 'nonexistent'
+      // Early validation catches no common substring before LLM correction
       const invocation = tool.build(params);
       const result = await invocation.execute(new AbortController().signal);
-      expect(result.llmContent).toMatch(
-        /0 occurrences found for old_string in/,
-      );
-      expect(result.returnDisplay).toMatch(
-        /Failed to edit, could not find the string to replace./,
-      );
+      expect(result.error?.type).toBe(ToolErrorType.EDIT_VALIDATION_FAILED);
+      expect(result.llmContent).toMatch(/No common content found/);
     });
 
     it('should return error if multiple occurrences of old_string are found', async () => {
@@ -883,10 +881,10 @@ describe('EditTool', () => {
         isAsyncTest: true,
       },
       {
-        name: 'NO_OCCURRENCE_FOUND error',
+        name: 'EDIT_VALIDATION_FAILED error (no common substring)',
         setup: (fp: string) => fs.writeFileSync(fp, 'content', 'utf8'),
         params: { file_path: '', old_string: 'not-found', new_string: 'new' },
-        expectedError: ToolErrorType.EDIT_NO_OCCURRENCE_FOUND,
+        expectedError: ToolErrorType.EDIT_VALIDATION_FAILED,
         isAsyncTest: true,
       },
       {
@@ -932,10 +930,17 @@ describe('EditTool', () => {
         },
         expectedError: ToolErrorType.FILE_WRITE_FAILURE,
         isAsyncTest: true,
+        // Skip on root user where file permissions are not enforced
+        skipIf: () => process.getuid?.() === 0,
       },
     ])(
       'should return $name',
-      async ({ setup, params, expectedError, isAsyncTest }) => {
+      async ({ setup, params, expectedError, isAsyncTest, skipIf }) => {
+        // Skip test if condition is met (e.g., running as root)
+        if (skipIf?.()) {
+          return;
+        }
+
         const testParams = {
           ...params,
           file_path: params.file_path || filePath,
@@ -1192,7 +1197,7 @@ describe('EditTool', () => {
       filePath = path.join(rootDir, testFile);
     });
 
-    it('should return NO_OCCURRENCE_FOUND when old_string expects content but file is empty', async () => {
+    it('should return EDIT_VALIDATION_FAILED when old_string expects content but file is empty', async () => {
       // Create an empty file
       fs.writeFileSync(filePath, '', 'utf8');
 
@@ -1202,14 +1207,12 @@ describe('EditTool', () => {
         new_string: 'function foo() { return 100; }',
       };
 
-      // Mock ensureCorrectEdit to return 0 occurrences (empty file has no matches)
-      mockEnsureCorrectEdit.mockResolvedValueOnce({ params, occurrences: 0 });
-
+      // Early validation catches this case before LLM correction is attempted
       const invocation = tool.build(params);
       const result = await invocation.execute(new AbortController().signal);
 
-      expect(result.error?.type).toBe(ToolErrorType.EDIT_NO_OCCURRENCE_FOUND);
-      expect(result.llmContent).toMatch(/0 occurrences found/);
+      expect(result.error?.type).toBe(ToolErrorType.EDIT_VALIDATION_FAILED);
+      expect(result.llmContent).toMatch(/Cannot find content in an empty file/);
     });
 
     it('should successfully create content in empty file when old_string is empty', async () => {
@@ -1248,13 +1251,11 @@ describe('EditTool', () => {
         new_string: 'const y = 20;',
       };
 
-      // ensureCorrectEdit will find 0 occurrences since file is now empty
-      mockEnsureCorrectEdit.mockResolvedValueOnce({ params, occurrences: 0 });
-
+      // Early validation catches empty file before LLM correction
       const invocation = tool.build(params);
       const result = await invocation.execute(new AbortController().signal);
 
-      expect(result.error?.type).toBe(ToolErrorType.EDIT_NO_OCCURRENCE_FOUND);
+      expect(result.error?.type).toBe(ToolErrorType.EDIT_VALIDATION_FAILED);
     });
 
     it('should handle file content that changed between read and edit', async () => {
@@ -1297,12 +1298,11 @@ describe('EditTool', () => {
         new_string: 'new content',
       };
 
-      mockEnsureCorrectEdit.mockResolvedValueOnce({ params, occurrences: 0 });
-
+      // Early validation catches empty file before LLM correction
       const invocation = tool.build(params);
       const result = await invocation.execute(new AbortController().signal);
 
-      expect(result.error?.type).toBe(ToolErrorType.EDIT_NO_OCCURRENCE_FOUND);
+      expect(result.error?.type).toBe(ToolErrorType.EDIT_VALIDATION_FAILED);
     });
 
     it('should normalize CRLF line endings to LF when reading file', async () => {
@@ -1402,7 +1402,8 @@ describe('EditTool', () => {
       // Mock ensureCorrectEdit to simulate a long-running operation that exceeds timeout
       // We use a never-resolving promise that respects the abort signal
       mockEnsureCorrectEdit.mockImplementationOnce(
-        async (_path, _content, _params, _client, _baseLlm, signal) => new Promise((resolve, reject) => {
+        async (_path, _content, _params, _client, _baseLlm, signal) =>
+          new Promise((resolve, reject) => {
             // Listen for abort signal
             signal?.addEventListener('abort', () => {
               reject(new DOMException('Aborted', 'AbortError'));
