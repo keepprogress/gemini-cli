@@ -1183,4 +1183,202 @@ describe('EditTool', () => {
       expect(totalActualRemoved).toBe(totalExpectedRemoved);
     });
   });
+
+  describe('Edge Cases - Empty File and Stale Content', () => {
+    const testFile = 'edge_case_test.txt';
+    let filePath: string;
+
+    beforeEach(() => {
+      filePath = path.join(rootDir, testFile);
+    });
+
+    it('should return NO_OCCURRENCE_FOUND when old_string expects content but file is empty', async () => {
+      // Create an empty file
+      fs.writeFileSync(filePath, '', 'utf8');
+
+      const params: EditToolParams = {
+        file_path: filePath,
+        old_string: 'function foo() { return 42; }', // Expects content
+        new_string: 'function foo() { return 100; }',
+      };
+
+      // Mock ensureCorrectEdit to return 0 occurrences (empty file has no matches)
+      mockEnsureCorrectEdit.mockResolvedValueOnce({ params, occurrences: 0 });
+
+      const invocation = tool.build(params);
+      const result = await invocation.execute(new AbortController().signal);
+
+      expect(result.error?.type).toBe(ToolErrorType.EDIT_NO_OCCURRENCE_FOUND);
+      expect(result.llmContent).toMatch(/0 occurrences found/);
+    });
+
+    it('should successfully create content in empty file when old_string is empty', async () => {
+      // File does not exist - will be created
+      const newFilePath = path.join(rootDir, 'new_empty_file.txt');
+      const newContent = 'function foo() { return 42; }';
+
+      const params: EditToolParams = {
+        file_path: newFilePath,
+        old_string: '', // Empty old_string for file creation
+        new_string: newContent,
+      };
+
+      mockEnsureCorrectEdit.mockResolvedValueOnce({ params, occurrences: 0 });
+
+      const invocation = tool.build(params);
+      const result = await invocation.execute(new AbortController().signal);
+
+      expect(result.llmContent).toMatch(/Created new file/);
+      expect(fs.existsSync(newFilePath)).toBe(true);
+      expect(fs.readFileSync(newFilePath, 'utf8')).toBe(newContent);
+    });
+
+    it('should handle file that becomes empty after external modification', async () => {
+      // Initially create file with content
+      const originalContent = 'const x = 1;\nconst y = 2;\nconst z = 3;';
+      fs.writeFileSync(filePath, originalContent, 'utf8');
+
+      // Simulate external modification that empties the file
+      // (In real scenario, another process might truncate the file)
+      fs.writeFileSync(filePath, '', 'utf8');
+
+      const params: EditToolParams = {
+        file_path: filePath,
+        old_string: 'const y = 2;', // Was in original content
+        new_string: 'const y = 20;',
+      };
+
+      // ensureCorrectEdit will find 0 occurrences since file is now empty
+      mockEnsureCorrectEdit.mockResolvedValueOnce({ params, occurrences: 0 });
+
+      const invocation = tool.build(params);
+      const result = await invocation.execute(new AbortController().signal);
+
+      expect(result.error?.type).toBe(ToolErrorType.EDIT_NO_OCCURRENCE_FOUND);
+    });
+
+    it('should handle file content that changed between read and edit', async () => {
+      // Initial content that the model "remembers"
+      const originalContent = 'function foo() {\n  return "hello";\n}';
+      fs.writeFileSync(filePath, originalContent, 'utf8');
+
+      // Content changes before edit (simulating concurrent modification)
+      const modifiedContent = 'function foo() {\n  return "world";\n}';
+      fs.writeFileSync(filePath, modifiedContent, 'utf8');
+
+      const params: EditToolParams = {
+        file_path: filePath,
+        old_string: 'return "hello";', // Based on stale content
+        new_string: 'return "goodbye";',
+      };
+
+      // ensureCorrectEdit will find 0 occurrences since content changed
+      mockEnsureCorrectEdit.mockResolvedValueOnce({ params, occurrences: 0 });
+
+      const invocation = tool.build(params);
+      const result = await invocation.execute(new AbortController().signal);
+
+      expect(result.error?.type).toBe(ToolErrorType.EDIT_NO_OCCURRENCE_FOUND);
+      // File should remain unchanged (with the modified content)
+      expect(fs.readFileSync(filePath, 'utf8')).toBe(modifiedContent);
+    });
+
+    it('should handle old_string that was valid but file was deleted and recreated empty', async () => {
+      // Create file with content
+      fs.writeFileSync(filePath, 'some content here', 'utf8');
+
+      // Simulate deletion and recreation as empty
+      fs.unlinkSync(filePath);
+      fs.writeFileSync(filePath, '', 'utf8');
+
+      const params: EditToolParams = {
+        file_path: filePath,
+        old_string: 'content',
+        new_string: 'new content',
+      };
+
+      mockEnsureCorrectEdit.mockResolvedValueOnce({ params, occurrences: 0 });
+
+      const invocation = tool.build(params);
+      const result = await invocation.execute(new AbortController().signal);
+
+      expect(result.error?.type).toBe(ToolErrorType.EDIT_NO_OCCURRENCE_FOUND);
+    });
+
+    it('should normalize CRLF line endings to LF when reading file', async () => {
+      // Create file with Windows-style line endings
+      const contentWithCRLF = 'line1\r\nline2\r\nline3';
+      fs.writeFileSync(filePath, contentWithCRLF, 'utf8');
+
+      const params: EditToolParams = {
+        file_path: filePath,
+        old_string: 'line2', // Using LF-normalized search
+        new_string: 'modified_line2',
+      };
+
+      // ensureCorrectEdit should normalize and find the match
+      mockEnsureCorrectEdit.mockImplementationOnce(async (_, content) => {
+        // Verify content was normalized (CRLF -> LF)
+        expect(content).toBe('line1\nline2\nline3');
+        return { params, occurrences: 1 };
+      });
+
+      const invocation = tool.build(params);
+      const result = await invocation.execute(new AbortController().signal);
+
+      expect(result.llmContent).toMatch(/Successfully modified file/);
+    });
+
+    it('should return ATTEMPT_TO_CREATE_EXISTING_FILE when trying to create over non-empty file', async () => {
+      // Create a file with existing content
+      fs.writeFileSync(filePath, 'existing content', 'utf8');
+
+      const params: EditToolParams = {
+        file_path: filePath,
+        old_string: '', // Attempting to create (empty old_string)
+        new_string: 'brand new content',
+      };
+
+      const invocation = tool.build(params);
+      const result = await invocation.execute(new AbortController().signal);
+
+      expect(result.error?.type).toBe(
+        ToolErrorType.ATTEMPT_TO_CREATE_EXISTING_FILE,
+      );
+      // File should remain unchanged
+      expect(fs.readFileSync(filePath, 'utf8')).toBe('existing content');
+    });
+
+    it('should handle multiline old_string that spans across different indentation levels', async () => {
+      const content = `class Foo {
+  constructor() {
+    this.value = 1;
+  }
+
+  getValue() {
+    return this.value;
+  }
+}`;
+      fs.writeFileSync(filePath, content, 'utf8');
+
+      const params: EditToolParams = {
+        file_path: filePath,
+        old_string: `  getValue() {
+    return this.value;
+  }`,
+        new_string: `  getValue() {
+    return this.value * 2;
+  }`,
+      };
+
+      mockEnsureCorrectEdit.mockResolvedValueOnce({ params, occurrences: 1 });
+
+      const invocation = tool.build(params);
+      const result = await invocation.execute(new AbortController().signal);
+
+      expect(result.llmContent).toMatch(/Successfully modified file/);
+      const newContent = fs.readFileSync(filePath, 'utf8');
+      expect(newContent).toContain('return this.value * 2;');
+    });
+  });
 });

@@ -40,7 +40,11 @@ import type {
 } from './modifiable-tool.js';
 import { IdeClient } from '../ide/ide-client.js';
 import { safeLiteralReplace } from '../utils/textUtils.js';
-import { EDIT_TOOL_NAME, READ_FILE_TOOL_NAME } from './tool-names.js';
+import {
+  EDIT_TOOL_NAME,
+  READ_FILE_TOOL_NAME,
+  WRITE_FILE_TOOL_NAME,
+} from './tool-names.js';
 import { debugLogger } from '../utils/debugLogger.js';
 
 export function applyReplacement(
@@ -503,7 +507,13 @@ Expectation for required parameters:
 3. \`new_string\` MUST be the exact literal text to replace \`old_string\` with (also including all whitespace, indentation, newlines, and surrounding code etc.). Ensure the resulting code is correct and idiomatic.
 4. NEVER escape \`old_string\` or \`new_string\`, that would break the exact literal text requirement.
 **Important:** If ANY of the above are not satisfied, the tool will fail. CRITICAL for \`old_string\`: Must uniquely identify the single instance to change. Include at least 3 lines of context BEFORE and AFTER the target text, matching whitespace and indentation precisely. If this string matches multiple locations, or does not match exactly, the tool will fail.
-**Multiple replacements:** Set \`expected_replacements\` to the number of occurrences you want to replace. The tool will replace ALL occurrences that match \`old_string\` exactly. Ensure the number of replacements matches your expectation.`,
+**Multiple replacements:** Set \`expected_replacements\` to the number of occurrences you want to replace. The tool will replace ALL occurrences that match \`old_string\` exactly. Ensure the number of replacements matches your expectation.
+
+**Failure Recovery (CRITICAL):**
+- If an edit fails 2-3 times with the same file, STOP and use ${READ_FILE_TOOL_NAME} to re-read the current content before retrying.
+- If \`old_string\` cannot be found after multiple attempts: (1) The file content may have changed - re-read it, (2) Consider using ${WRITE_FILE_TOOL_NAME} to replace the entire file instead.
+- NEVER retry the exact same edit parameters more than 2 times - always adjust your approach.
+- For empty files: use \`old_string=""\` to create content, not a non-empty old_string.`,
       Kind.Edit,
       {
         properties: {
