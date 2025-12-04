@@ -42,8 +42,19 @@ import { SmartEditCorrectionEvent } from '../telemetry/types.js';
 import { logSmartEditCorrectionEvent } from '../telemetry/loggers.js';
 
 import { correctPath } from '../utils/pathCorrector.js';
-import { EDIT_TOOL_NAME, READ_FILE_TOOL_NAME } from './tool-names.js';
+import {
+  EDIT_TOOL_NAME,
+  READ_FILE_TOOL_NAME,
+  WRITE_FILE_TOOL_NAME,
+} from './tool-names.js';
 import { debugLogger } from '../utils/debugLogger.js';
+
+/**
+ * Maximum time allowed for an edit operation before timeout.
+ * This prevents the edit tool from hanging indefinitely during
+ * LLM correction attempts or slow file system operations.
+ */
+const EDIT_OPERATION_TIMEOUT_MS = 60000; // 60 seconds
 interface ReplacementContext {
   params: EditToolParams;
   currentContent: string;
@@ -727,10 +738,26 @@ class EditToolInvocation
    * @returns Result of the edit operation
    */
   async execute(signal: AbortSignal): Promise<ToolResult> {
+    // Create a combined signal that aborts on either user cancellation or timeout
+    const timeoutSignal = AbortSignal.timeout(EDIT_OPERATION_TIMEOUT_MS);
+    const combinedSignal = AbortSignal.any([signal, timeoutSignal]);
+
     let editData: CalculatedEdit;
     try {
-      editData = await this.calculateEdit(this.params, signal);
+      editData = await this.calculateEdit(this.params, combinedSignal);
     } catch (error) {
+      // Check if the operation timed out
+      if (timeoutSignal.aborted && !signal.aborted) {
+        const timeoutMsg = `Edit operation timed out after ${EDIT_OPERATION_TIMEOUT_MS / 1000}s. The file may be too large or the LLM correction is taking too long. Consider using ${WRITE_FILE_TOOL_NAME} to replace the entire file content instead, or break the edit into smaller changes.`;
+        return {
+          llmContent: timeoutMsg,
+          returnDisplay: `Error: Edit operation timed out`,
+          error: {
+            message: timeoutMsg,
+            type: ToolErrorType.EDIT_OPERATION_TIMEOUT,
+          },
+        };
+      }
       if (signal.aborted) {
         throw error;
       }
